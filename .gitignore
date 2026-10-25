@@ -1,0 +1,18 @@
+# 构建/下载临时目录，不入库
+.build/
+.build-diag/
+_dl*/
+out/
+*.deb
+*.o
+*.dylib
+.DS_Store
+
+# ★★★ 绝不入库：调试时临时落盘的凭据文件
+.tok
+*.tok
+*.token
+.env
+.env.*
+# 下载的 CI 产物压缩包，不入库
+packages-*.zip

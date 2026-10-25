@@ -1,0 +1,100 @@
+name: Build Package
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+env:
+  # 版本号单一来源。
+  # 1.0-1：首个版本 —— 只做一件事：小窗（画中画）里点 ±10 秒切上/下一条视频。
+  VERSION: 1.0-1
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
+
+jobs:
+  # ---------------------------------------------------------------------
+  # 第一道闸：源码级静态校验（不依赖工具链，秒级）
+  #
+  # ★ 检查项以「运行期会崩 / 装了不生效」为主，不只查「编不过」。
+  #   本插件的关键风险点：
+  #     ① 签名装错（CMTime vs double）→ block 从错误寄存器读 → 崩宿主
+  #     ② 幂等闸失效 → 重复替换 → orig 指向自己 → 自递归 → 崩宿主
+  #     ③ selector 少 Handler 后缀 → 0 命中 → 点了完全没反应
+  #     ④ 顺手把锁屏/保活加回来 → 又变成"整合版"，用户明确拒绝
+  # ---------------------------------------------------------------------
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Source self-check
+        run: |
+          set -e
+          python3 tools/check_source.py
+
+      # ★ 反向验证：证明上面的检查项「真的在跑」。
+      #   只有「注入违规 → 检查必须非 0」才能证明判据有效；
+      #   否则「全部通过」可能只是「检查压根没执行」。
+      #   ★ 每一例都断言「是哪个判据拦下的」，不只看红没红 ——
+      #     注入可能顺带破坏别的判据，「红了」不等于「红对了」。
+      - name: Verify checks actually fire (negative test)
+        run: |
+          set -e
+          python3 tools/verify_negative.py
+
+  # ---------------------------------------------------------------------
+  # 构建：零 Theos（xcrun clang → codesign → Python 拼 ar）
+  # ---------------------------------------------------------------------
+  build:
+    needs: verify
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Show toolchain
+        run: |
+          set -e
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos --show-sdk-version
+
+      # ★ 只编 arm64：宿主是抖音 App，App Store 分发的 App 一律 arm64。
+      #   包标签分两种只是为了让不同设备的 Sileo 都愿意安装，
+      #   dylib 本身在两种包里字节相同。
+      - name: Build (arm64e label)
+        run: |
+          set -e
+          sh devkit/build.sh iphoneos-arm64e "$VERSION"
+          cp .build/out/*.deb .
+
+      - name: Build (arm64 label)
+        run: |
+          set -e
+          sh devkit/build.sh iphoneos-arm64 "$VERSION"
+          cp .build/out/*.deb .
+
+      - name: Report packages
+        run: |
+          set -e
+          echo "--- 产物 ---"
+          ls -l *.deb
+          for f in *.deb; do
+            echo ""
+            echo "== $f =="
+            echo "size   : $(wc -c < "$f")"
+            echo "sha256 : $(shasum -a 256 "$f" | cut -d' ' -f1)"
+          done
+
+      - name: Upload Packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ env.VERSION }}
+          path: "*.deb"
+          if-no-files-found: error
