@@ -30,14 +30,22 @@ find "$STAGE" -type f -exec chmod 644 {} \;
 chmod 755 "$STAGE/Library/MobileSubstrate/DynamicLibraries/$NAME.dylib"
 
 # ---- control ----
-# ★ Conflicts / Replaces 写 com.liehuu.awemenextprev：
-#   本插件接管了小窗切换这一项，与旧三合一包功能重叠。
-#   两个 dylib 同时注入抖音、各自 hook 同一个 delegate，
-#   会出现「谁先装谁生效、另一个拿到的是对方的 imp」的互相干扰
-#   （旧包还额外 hook 了保持播放那一整套，正是自动暂停的来源）。
-#   → 用 dpkg 依赖声明强制二选一，装本插件时自动卸掉旧包。
-#   ★ 用 Conflicts+Replaces 而不是只有 Conflicts：只有 Conflicts 时
-#     dpkg 会拒绝安装并让用户手动处理；加 Replaces 才能顺畅替换。
+# ★★ 不写任何 Conflicts / Replaces —— 1.0-1 曾误写
+#      Conflicts: com.liehuu.awemenextprev
+#    结果装本插件时会把「AwemeNextPrev-pure 1.0-2（锁屏上一首/下一首）」
+#    一起卸掉。这是错的，实测依据：
+#      · pure 1.0-2 是**零 hook** 的纯公开 API 实现
+#        （dylib 里 MSHookMessageEx / method_setImplementation /
+#          libsubstrate 全部为 False，只链 Foundation/UIKit/MediaPlayer）；
+#      · 它只用 MPRemoteCommandCenter + UIScrollView 滚动，
+#        完全不碰画中画（dylib 里 Pip / PictureInPicture /
+#        sampleBuffer / AVSampleBuffer 全部为 False）。
+#    → 两者作用点不重叠、触发源不同（锁屏遥控 vs 画中画按钮），
+#      文件不同名（AwemeNextPrev.dylib vs AwemePipSwitch.dylib），
+#      可以同装：锁屏用 pure，小窗用本插件。
+#   ★ 唯一需要用户自己避免的组合：与本插件同样 hook 了画中画 delegate
+#     的旧「3.0-1 整合版」——那个包名相同，但用户已明确弃用，
+#     由 Description 里提示，不用 dpkg 硬拦（硬拦会误伤 1.0-2）。
 cat > "$STAGE/DEBIAN/control" <<EOF
 Package: $PKG
 Name: 抖音小窗切视频
@@ -50,12 +58,12 @@ Description: 抖音小窗（画中画）里点「±10 秒」→ 切上一条/下
  不含锁屏遥控、不含后台保持播放、无开关、无日志、无弹窗。
  实现：拦画中画 sample-buffer 的 skipByInterval:completionHandler:，
  转成主信息流 scrollView 的相邻行滚动。
+ 与「AwemeNextPrev-pure 1.0-2（锁屏上一首/下一首）」不冲突，可同装：
+ 那个是纯公开 API、零 hook、只做锁屏遥控；本插件只做小窗。
 Maintainer: liehuu
 Author: liehuu
 Section: Tweaks
 Depends: mobilesubstrate
-Conflicts: com.liehuu.awemenextprev
-Replaces: com.liehuu.awemenextprev
 EOF
 chmod 644 "$STAGE/DEBIAN/control"
 

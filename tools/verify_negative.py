@@ -454,13 +454,45 @@ case("D5 加回设置页目录", m_d5, "D5 不打设置页 bundle")
 
 
 def m_d6():
+    """往 control 正文里加回 Conflicts/Replaces（1.0-1 的真实错误）。
+
+    ★ 必须注入到 here-doc **正文内部**（Depends 那行之后），
+      不能加到 mkdeb.sh 注释里 —— 判据锚的是 control 正文，
+      注入到注释里判据根本看不到，会得到「加了违规却仍全绿」的假象。
+    """
     s = read("devkit/mkdeb.sh")
-    s = s.replace("Conflicts: com.liehuu.awemenextprev\n", "")
-    s = s.replace("Replaces: com.liehuu.awemenextprev\n", "")
+    s = s.replace("Depends: mobilesubstrate\nEOF",
+                  "Depends: mobilesubstrate\n"
+                  "Conflicts: com.liehuu.awemenextprev\n"
+                  "Replaces: com.liehuu.awemenextprev\nEOF")
     write("devkit/mkdeb.sh", s)
 
 
-case("D6 去掉 Conflicts", m_d6, "D6 声明 Conflicts 旧包")
+case("D6 加回 Conflicts 旧包", m_d6, "D6 Conflicts 不针对 awemenextprev")
+
+
+def m_d6b():
+    """只加 Conflicts 不加 Replaces —— 仍必须被拦（判据逐字段查）。"""
+    s = read("devkit/mkdeb.sh")
+    s = s.replace("Depends: mobilesubstrate\nEOF",
+                  "Depends: mobilesubstrate\n"
+                  "Breaks: com.liehuu.awemenextprev\nEOF")
+    write("devkit/mkdeb.sh", s)
+
+
+case("D6b 加回 Breaks 旧包", m_d6b, "D6 Breaks 不针对 awemenextprev")
+
+
+def m_d6z():
+    """删掉 Description 里「可同装」的说明 —— 用户会误以为二选一。"""
+    s = read("devkit/mkdeb.sh")
+    old = (" 与「AwemeNextPrev-pure 1.0-2（锁屏上一首/下一首）」不冲突，可同装：\n"
+           " 那个是纯公开 API、零 hook、只做锁屏遥控；本插件只做小窗。\n")
+    s = s.replace(old, "")
+    write("devkit/mkdeb.sh", s)
+
+
+case("D6z 删掉可同装说明", m_d6z, "D6z Description 说明与 pure 1.0-2 可同装")
 
 
 def m_d7():

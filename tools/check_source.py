@@ -168,6 +168,23 @@ if pi_body:
     # 正项：postinst 必须真的存在并且有提示（用户要知道怎么用）
     ok("已安装" in pi_body, "A7z postinst 有安装提示")
 
+
+# ★★ 同理：control 的字段判据也必须锚到 control here-doc 正文。
+#    mkdeb.sh 的注释里写着「不写任何 Conflicts / Replaces —— 1.0-1 曾误写」，
+#    全文件搜 "Conflicts" 会命中这句**说明**，把「没有冲突声明」判成「有」。
+#    （和 A7 一模一样的坑，判据必须锚被检查的那一段。）
+def control_body(script):
+    """取出 `cat > .../DEBIAN/control` here-doc 的实际内容。"""
+    m = re.search(
+        r"cat\s*>\s*\"?\$\{?\w*\}?/DEBIAN/control\"?\s*<<\s*'?(\w+)'?\s*\n(.*?)\n\1\s*$",
+        script, re.S | re.M)
+    return m.group(2) if m else None
+
+
+ct_body = control_body(mkdeb)
+ok(ct_body is not None, "D6 能找到 control here-doc 内容",
+   "找不到就无法检查，不能当成通过")
+
 # A8 tar 必须是 GNU_FORMAT（PAX 扩展头 dpkg 不认）
 ok("format=tarfile.GNU_FORMAT" in mkdeb, "A8 tar 用 GNU_FORMAT")
 ok("_check_no_pax_headers" in mkdeb, "A8b 有 PAX 扩展头自检")
@@ -441,17 +458,51 @@ for bad in ("CFPreferences", "UIAlertController", "NSUserDefaults",
 # D5 包不许带设置页
 ok("PreferenceBundles" not in mkdeb, "D5 不打设置页 bundle")
 
-# D6 必须声明与旧包的 Conflicts/Replaces（两个 dylib 同时 hook 会互相干扰）
-ok("Conflicts: com.liehuu.awemenextprev" in mkdeb,
-   "D6 声明 Conflicts 旧包",
-   "两个 dylib 同时注入、各自 hook 同一 delegate → 互相干扰")
-ok("Replaces: com.liehuu.awemenextprev" in mkdeb,
-   "D6b 声明 Replaces 旧包",
-   "只有 Conflicts 会让 dpkg 拒绝安装，加 Replaces 才能顺畅替换")
+# ------------------------------------------------------------
+# D6 绝不许声明与 com.liehuu.awemenextprev 的 Conflicts/Replaces
+# ★★ 这是 1.0-1 的真实事故：当时写了
+#      Conflicts: com.liehuu.awemenextprev
+#      Replaces:  com.liehuu.awemenextprev
+#    结果是装本插件会把用户仍在用的
+#    「AwemeNextPrev-pure 1.0-2（锁屏上一首/下一首）」一起卸掉。
+#    判据锚在 control here-doc 正文，不能全文件搜（注释里就是这几个字）。
+#
+#    为什么不冲突（产物级实测，不是推理）：
+#      · pure 1.0-2 是零 hook：MSHookMessageEx / method_setImplementation /
+#        libsubstrate 在 dylib 里全是 False，只链 Foundation/UIKit/MediaPlayer；
+#      · 它只用 MPRemoteCommandCenter + UIScrollView，完全不碰画中画
+#        （Pip / PictureInPicture / sampleBuffer / AVSampleBuffer 全 False）；
+#      · 两个 dylib 也不同名（AwemeNextPrev.dylib / AwemePipSwitch.dylib）。
+#    → 作用点不重叠、触发源不同、无共享方法表 → 可同装。
+# ------------------------------------------------------------
+if ct_body:
+    # 逐字段判：只看 control 字段行，不看说明文字
+    fields = {}
+    for line in ct_body.splitlines():
+        if ":" in line and not line.startswith(" "):
+            k, v = line.split(":", 1)
+            fields[k.strip()] = v.strip()
+    for fld in ("Conflicts", "Breaks", "Replaces"):
+        val = fields.get(fld, "")
+        ok("com.liehuu.awemenextprev" not in val,
+           "D6 %s 不针对 awemenextprev" % fld,
+           "写了会把用户仍在用的 pure 1.0-2（锁屏上一首/下一首）一起卸掉")
+    # 正项：既然不加 Conflicts，就必须在 Description 里说明与 pure 可同装，
+    #       否则用户会以为二选一（信息缺失也是设计缺陷）。
+    #   ★ 大小写不敏感：Description 里写的是「AwemeNextPrev-pure」，
+    #     包里名是 com.liehuu.awemenextprev，两者大小写不同，不能直接 in。
+    ok("awemenextprev" in ct_body.lower(),
+       "D6z Description 说明与 pure 1.0-2 可同装",
+       "不加 Conflicts 就必须写清楚，否则用户会以为要二选一")
 
 # D7 依赖只有 mobilesubstrate（不要 preferenceloader，本包没设置页）
-ok("Depends: mobilesubstrate" in mkdeb, "D7 Depends 只有 mobilesubstrate")
-ok("preferenceloader" not in mkdeb, "D7b 不依赖 preferenceloader")
+if ct_body:
+    dep = ""
+    for line in ct_body.splitlines():
+        if line.startswith("Depends:"):
+            dep = line.split(":", 1)[1]
+    ok("mobilesubstrate" in dep, "D7 Depends 含 mobilesubstrate")
+    ok("preferenceloader" not in ct_body, "D7b 不依赖 preferenceloader")
 
 # ============================================================
 # 汇总

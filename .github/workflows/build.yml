@@ -8,7 +8,10 @@ on:
 env:
   # 版本号单一来源。
   # 1.0-1：首个版本 —— 只做一件事：小窗（画中画）里点 ±10 秒切上/下一条视频。
-  VERSION: 1.0-1
+  # 1.0-2：撤销 1.0-1 里误加的 Conflicts/Replaces: com.liehuu.awemenextprev。
+  #        实测证明那个包（pure 1.0-2，锁屏上一首/下一首）是零 hook 的
+  #        纯公开 API 实现，完全不碰画中画，与本插件可同装。
+  VERSION: 1.0-2
   HOMEBREW_NO_AUTO_UPDATE: 1
   HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
 
