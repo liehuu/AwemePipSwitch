@@ -481,6 +481,21 @@ if rt:
        "按「本次装了几个」判 → 幂等闸挡住后永远认为失败 → 每秒重扫")
     ok("PS_RETRY_MAX_TICKS" in rt, "C12c 有次数上限（不会无限跑）")
 
+# C13 ★★★ 补装必须仍会重扫全表 —— 否则就是功能回退
+#   1.0-2 的定时器每秒重扫，所以「懒注册的 delegate 类在 30 秒内注册」
+#   和「落点类名不在硬编码表里」（lite 版 / 别的 iOS 版本）都能兜住。
+#   如果为了性能把补装缩成「只试硬编码类」，这两种情况就永远装不上
+#   → 小窗点了没反应。这是**不能接受的功能回退**，必须用判据钉住。
+if rt:
+    ok("PSInstallByScan" in rt,
+       "C13 补装内仍会重扫全表（覆盖类名未知 / 懒注册的场景）",
+       "只试硬编码类 = lite 版或改名的 delegate 永远装不上 = 功能回退")
+    ok("gPipRetryTick >= PS_SCAN_FIRST_TICK" in rt,
+       "C13b 重扫前先等启动完成（PS_SCAN_FIRST_TICK）")
+    ok("gPipRetryTick % PS_SCAN_EVERY_TICKS" in rt,
+       "C13c 重扫有间隔下限（不是每秒）",
+       "每秒重扫 = 1.0-2 的卡顿；不重扫 = 功能回退。两头都要挡")
+
 # ============================================================
 # E 组：启动路径性能（1.0-2 的真实事故：装完启动要等 10 秒）
 #   背景：objc_getClassList 拿到 5 万个类，对每个类调 class_copyMethodList
@@ -504,8 +519,8 @@ if ctor:
 # E2 全表扫绝不许跑在主线程
 #   ★ 判据锚 dispatch 的目标队列：必须是 PSWorkQueue()（后台串行），
 #     不许是 dispatch_get_main_queue()。
-ds = body_of(src, "PSDeferredScan")
-ok(ds is not None, "E2 能找到 PSDeferredScan 函数体")
+ds = body_of(src, "PSRetryTick")
+ok(ds is not None, "E2 能找到 PSRetryTick 函数体")
 if ds:
     ok("PSWorkQueue()" in ds, "E2b 全表扫调度到后台队列")
     ok("dispatch_get_main_queue" not in ds, "E2c 全表扫不排到主队列",
@@ -514,7 +529,7 @@ if ds:
 #     （PSHandlePipSkip → PSSwitchFeed）**必须**回主线程，那是 UIKit 硬要求。
 #     所以只约束「装配/扫描这条链」。
 for fn in ("PSRetryTick", "PSStartBackgroundRetry", "PSInstallFast",
-           "PSInstallKnownClasses", "PSInstallByScan", "PSInstallPipHook"):
+           "PSInstallKnownClasses", "PSInstallByScan"):
     fb = body_of(src, fn)
     if fb is None:
         continue
@@ -531,26 +546,42 @@ if wq:
        "E3c 队列是低优先级（不抢启动的 CPU）")
     ok("dispatch_once" in wq, "E3d 队列只建一次")
 
-# E4 全表扫一辈子只跑一次（不能每 tick 重跑）
-ok("gPipScanDone" in src, "E4 有全表扫的「已跑过」标记")
-if ds:
-    ok("gPipScanDone = YES" in ds, "E4b 扫描前置位标记（异常也不会重跑）")
-    ok("if (gPipScanDone) return;" in ds, "E4c 已跑过就早退")
-# ★ 全表扫只允许在这两处被调用：延时扫描、以及 PSInstallPipHook 之外的地方。
-#   数调用点能防「又在某个循环里加回全表扫」。
+# E4 全表扫不许每秒跑（1.0-2 是每秒 4 次、连跑 30 秒）
+#   ★ 1.0-2 的定时器每秒都重扫全表，那是主线程被占死的来源。
+#     1.0-3 保留「周期性重扫」（保证懒注册/类名未知的场景仍能兜住），
+#     但必须①只在后台 ②有间隔下限 ③装好就停。
+ok("PS_SCAN_EVERY_TICKS" in src, "E4 有全表扫的间隔常量")
+_m2 = re.search(r"#define\s+PS_SCAN_EVERY_TICKS\s+(\d+)", src)
+ok(_m2 is not None, "E4b PS_SCAN_EVERY_TICKS 是整数常量")
+if _m2:
+    ok(int(_m2.group(1)) >= 3,
+       "E4c 全表扫间隔 >= 3 秒（实际 %s 秒）" % _m2.group(1),
+       "每秒扫全表 = 1.0-2 那 10 秒卡顿的成因")
+#   ★★ 决定性的判据：整个文件里 PSInstallByScan 只允许一个调用点
+#     （PSRetryTick 内部，且已被上面的间隔常量 + 后台队列 + 装好即停三重约束）。
+#     多于一处 = 又变成 1.0-2 那种多头重扫。
 ok(src.count("PSInstallByScan(") == 2,
    "E4d PSInstallByScan 只有一个调用点（实际 %d 处）" % src.count("PSInstallByScan("),
    "多于一处 = 又在重复扫全表")
+#   ★ 装好就停：扫描后必须置「已装数」，否则每秒还会继续扫
+if ds:
+    ok("gPipHookedCount" in ds, "E4e 补装读「已装数」决定是否继续")
+    ok("gPipRetryTick > PS_RETRY_MAX_TICKS" in ds,
+       "E4f 有总次数上限（不会无限跑）")
 
-# E5 全表扫必须延后到启动完成之后（不能和首帧抢 CPU）
-ok("PS_SCAN_DELAY" in src, "E5 全表扫有独立延时常量")
-ok(re.search(r"#define\s+PS_SCAN_DELAY\s+([0-9.]+)", src) is not None,
-   "E5b PS_SCAN_DELAY 是秒数常量")
-_m = re.search(r"#define\s+PS_SCAN_DELAY\s+([0-9.]+)", src)
+# E5 首次全表扫必须延后到启动完成之后（不能与首帧抢 CPU）
+ok("PS_SCAN_FIRST_TICK" in src, "E5 全表扫有首次延后常量")
+ok(re.search(r"#define\s+PS_SCAN_FIRST_TICK\s+(\d+)", src) is not None,
+   "E5b PS_SCAN_FIRST_TICK 是整数常量")
+_m = re.search(r"#define\s+PS_SCAN_FIRST_TICK\s+(\d+)", src)
 if _m:
-    ok(float(_m.group(1)) >= 5.0,
-       "E5c 全表扫延时 >= 5 秒（实际 %s）" % _m.group(1),
+    ok(int(_m.group(1)) >= 5,
+       "E5c 首次全表扫延后 >= 5 秒（实际 %s 秒）" % _m.group(1),
        "太早扫会与首帧抢 CPU，启动照样慢")
+if ds:
+    ok("gPipRetryTick >= PS_SCAN_FIRST_TICK" in ds,
+       "E5d 补装内真的校验了首次延后（不只是定义了常量）",
+       "定义了常量但不用 = 判据空转")
 
 # E6 扫表内必须用「廉价预筛」，不能对每个类都复制方法表
 if sc:

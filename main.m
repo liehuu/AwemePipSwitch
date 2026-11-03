@@ -44,13 +44,17 @@
 //   修法（功能零回退）：
 //     ① 硬编码类路（实机日志实证的落点）提到最前，O(1) 命中即收工；
 //        pre-main 阶段只允许做这一件事。
-//     ② 全表扫加「廉价预筛」：先 class_getInstanceMethod（走 dtable，
-//        O(1)、不 malloc），只有命中的几十个类才做 class_copyMethodList
+//     ② 全表扫加「廉价预筛」：先 class_respondsToSelector（走 dtable，
+//        O(1)、不 malloc），只有命中的少数类才做 class_copyMethodList
 //        → 单次全表从 2~5 秒降到 ~30 毫秒。
-//     ③ 全表扫从主线程挪到后台队列（UTILITY QoS），轮询用 dispatch_after
-//        递归，不再用 NSTimer 占主线程。
-//     ④ 全表扫**仍然保留**（其它实现同一 selector 的类照样会被补装上），
-//        只是不再阻塞启动 —— 功能面与 1.0-2 一致。
+//     ③ 删除「按协议逐类枚举」那 3 条路 —— 它的条件是 selector 全扫路的
+//        严格子集（A∧B ⊆ B），覆盖不到任何 selector 路覆盖不到的类，
+//        纯属把同一张类表多走 3 遍。
+//     ④ 全表扫从主线程挪到后台串行队列（UTILITY QoS），补装用
+//        dispatch_after 递归，不再用 NSTimer 占主线程。
+//     ⑤ 补装仍会周期性重扫全表（只是从「每秒 4 次」降到「每 5 秒 1 次」），
+//        保证「懒注册的 delegate 类 / 类名不在硬编码表里」这些场景
+//        仍能兜住 —— 这是 1.0-2 已经有、绝不能退化的能力。
 // ============================================================================
 
 #import <Foundation/Foundation.h>
@@ -576,9 +580,6 @@ static void PSMakePipSkipImp(Class cls, SEL s, IMP *outNewImp, void **outOrigSlo
 /// 已经装上的「类|selector」个数（含本次装上的与之前装过的）。
 /// ★ 不用 BOOL：需要区分「一个都没装上」与「装上了 N 个」。
 static int  gPipHookedCount = 0;
-/// 全表扫是否已经跑过（不再重复跑 —— 类表在启动后不会突然多出 arm64e 类，
-/// 真正懒注册的 delegate 类由「后台补装」这一条路负责，与全表扫无关）。
-static BOOL gPipScanDone = NO;
 /// 后台扫描/补装串行队列（绝不占主线程）。
 static dispatch_queue_t PSWorkQueue(void) {
     static dispatch_queue_t q = NULL;
@@ -629,64 +630,58 @@ static void PSInstallFast(void) {
     if (PSInstallKnownClasses(sel)) gPipHookedCount++;
 }
 
-/// 后台补装：每 1 秒重试一次硬编码类，最多 30 次；装好即收工。
+/// 后台补装循环：每秒一次；装好即收工。
+///
 /// ★ 1.0-2 是主线程 NSTimer 每秒重跑 4 次全表扫 → 启动期主线程被占死。
-///   这里每次 tick 只做 O(1) 的硬编码类尝试，且整段在后台队列，
-///   主线程零参与。
-/// ★ 不用 block 自捕获（`__block void (^b)(void) = ^{ ... b(); }` 会
-///   自持有形成环）—— 改成静态计数 + 普通函数，dispatch 里只放一个调用。
-#define PS_RETRY_MAX_TICKS 30
+///   这里整段在后台串行队列，主线程零参与。
+///
+/// ★★★ 为什么补装阶段**还要**重扫全表（不能只试硬编码类）：
+///   1.0-2 的定时器每秒都重扫，所以「懒注册的 delegate 类在 30 秒内
+///   注册」这个场景一定能兜住。如果这里只试硬编码类，那么落点类名
+///   一旦不是那一个（抖音 lite 版、不同 iOS 版本的自研 delegate），
+///   就永远装不上 → 小窗点了没反应。这是**功能回退**，不能接受。
+///   所以：补装阶段仍然重扫全表，只是把频率从「每秒 4 次」降到
+///   「每 5 秒 1 次」，且全部在后台。折算下来后台 CPU 占比
+///   ≈ 30ms / 5s = 0.6%，主线程 0%。
+#define PS_RETRY_MAX_TICKS   60    // 每秒一次，共覆盖 60 秒（1.0-2 只有 30 秒）
+#define PS_SCAN_FIRST_TICK   8     // 第一次全表扫等到启动结束之后
+#define PS_SCAN_EVERY_TICKS  5     // 之后每 5 秒重扫一次（仅当还没装好）
+
 static int gPipRetryTick = 0;
 
 static void PSRetryTick(void) {
     @try {
         gPipRetryTick++;
         SEL sel = PSPipSkipSelector();
-        // 后续 tick 只试硬编码类：delegate 类懒注册时靠这条补上
-        if (sel && PSInstallKnownClasses(sel)) {
-            if (gPipHookedCount == 0) gPipHookedCount = 1;
+        BOOL ready = NO;
+
+        // 每秒都试硬编码类（O(1)，微秒级）
+        if (sel && PSInstallKnownClasses(sel)) ready = YES;
+
+        // 还没装好 → 周期性重扫全表兜住「类名未知 / 懒注册」的情况
+        if (!ready && gPipHookedCount == 0 && sel &&
+            gPipRetryTick >= PS_SCAN_FIRST_TICK &&
+            (gPipRetryTick % PS_SCAN_EVERY_TICKS) == 0) {
+            int n = PSInstallByScan(sel);
+            if (n > 0) {
+                gPipHookedCount = n;
+                ready = YES;
+            }
         }
-        if (gPipHookedCount > 0 || gPipRetryTick > PS_RETRY_MAX_TICKS) return;
+
+        if (ready || gPipHookedCount > 0 || gPipRetryTick > PS_RETRY_MAX_TICKS) return;
         dispatch_after(
             dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
             PSWorkQueue(), ^{ PSRetryTick(); });
     } @catch (NSException *e) { }
 }
 
-/// 启动完成后才做的全表扫。
-///
-/// ★★★ 为什么要延迟：全表扫必须**亲眼看过 5 万个类**才能确认「谁实现了
-///   这个方法」，其中 class_copyMethodList 会 malloc + 复制整张方法表，
-///   累计是秒级 CPU。放后台只能让主线程不等它，但 CPU 被抢着用一样会
-///   拖慢首帧。真正干净的做法是：**先让启动跑完**，再在空闲时补这趟扫描。
-///   · 实机日志实证的落点类已在构造器里 O(1) 装好 → 前 PS_SCAN_DELAY 秒
-///     内进小窗完全正常；
-///   · 全表扫的用途是「覆盖其它同样实现了该 selector 的类」（lite 版、
-///     不同 iOS 版本的自研 delegate），晚一点扫不影响这些场景。
-#define PS_SCAN_DELAY 8.0
-
-static void PSDeferredScan(void) {
-    dispatch_after(
-        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(PS_SCAN_DELAY * NSEC_PER_SEC)),
-        PSWorkQueue(), ^{
-            @try {
-                if (gPipScanDone) return;
-                gPipScanDone = YES;   // 先置位：即使扫描中抛异常也不再重跑
-                SEL sel = PSPipSkipSelector();
-                if (sel) {
-                    int n = PSInstallByScan(sel);
-                    if (n > 0 && gPipHookedCount == 0) gPipHookedCount = n;
-                }
-            } @catch (NSException *e) { }
-        });
-}
-
 static void PSStartBackgroundRetry(void) {
+    // 第一轮补装立刻跑（只碰硬编码类，微秒级；全表扫由 tick 计数控制，
+    // 会等到 PS_SCAN_FIRST_TICK 之后，即启动完成之后）
     dispatch_async(PSWorkQueue(), ^{
-        // 第一轮补装立刻跑（只碰硬编码类，微秒级）
         @try { PSRetryTick(); } @catch (NSException *e) { }
     });
-    PSDeferredScan();
 }
 
 #pragma mark - 入口

@@ -399,8 +399,11 @@ case("C11 去掉延迟补装", m_c11, "C11d 构造器有延迟补装")
 
 def m_c12():
     s = read("main.m")
-    s = s.replace("if (gPipHookedCount > 0 || gPipRetryTick > PS_RETRY_MAX_TICKS) return;",
-                  "if (gPipRetryTick > PS_RETRY_MAX_TICKS) return;")
+    # ★ 注入「装好也不收工」：把判据里的已装数去掉。
+    #   （C12b 查的是 gPipHookedCount > 0 是否在 PSRetryTick 体内）
+    s = s.replace(
+        "if (ready || gPipHookedCount > 0 || gPipRetryTick > PS_RETRY_MAX_TICKS) return;",
+        "if (gPipRetryTick > PS_RETRY_MAX_TICKS) return;")
     write("main.m", s)
 
 
@@ -583,17 +586,19 @@ case("E1c 删掉构造器的 O(1) 快装", m_e1c, "E1b 构造器调 O(1) 的 PSI
 
 
 def m_e2():
-    """全表扫排回主队列 —— 启动期 UI 直接卡住。"""
+    """重扫排回主队列 —— 启动期 UI 直接卡住。"""
     s = read("main.m")
-    old = """        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(PS_SCAN_DELAY * NSEC_PER_SEC)),
-        PSWorkQueue(), ^{"""
+    old = """        dispatch_after(
+            dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+            PSWorkQueue(), ^{ PSRetryTick(); });"""
     assert old in s, "注入点没找到"
-    s = s.replace(old, """        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(PS_SCAN_DELAY * NSEC_PER_SEC)),
-        dispatch_get_main_queue(), ^{""")
+    s = s.replace(old, """        dispatch_after(
+            dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+            dispatch_get_main_queue(), ^{ PSRetryTick(); });""")
     write("main.m", s)
 
 
-case("E2 全表扫改排主队列", m_e2, "E2b 全表扫调度到后台队列")
+case("E2 重扫改排主队列", m_e2, "E2b 全表扫调度到后台队列")
 
 
 def m_e3():
@@ -617,38 +622,86 @@ case("E3c 队列优先级提到交互级", m_e3c, "E3c 队列是低优先级")
 
 
 def m_e4():
-    """去掉「已跑过」早退 —— 每次补装都重扫全表。"""
+    """去掉装好即停 —— 装上了还继续每秒重扫，白烧 CPU。"""
     s = read("main.m")
-    old = "                if (gPipScanDone) return;"
+    old = "        if (ready || gPipHookedCount > 0 || gPipRetryTick > PS_RETRY_MAX_TICKS) return;"
     assert old in s, "注入点没找到"
-    s = s.replace(old, "                // 早退被删掉了")
+    s = s.replace(old, "        if (gPipRetryTick > PS_RETRY_MAX_TICKS) return;")
     write("main.m", s)
 
 
-case("E4 去掉全表扫的已跑过早退", m_e4, "E4c 已跑过就早退")
+case("E4 补装去掉装好即停", m_e4, "C12b 装好即收工")
+
+
+def m_e4c():
+    """把重扫间隔改成每秒 —— 1.0-2 的卡顿成因（主线程 + 每秒 4 次）。"""
+    s = read("main.m")
+    s = s.replace("#define PS_SCAN_EVERY_TICKS  5", "#define PS_SCAN_EVERY_TICKS  1")
+    write("main.m", s)
+
+
+case("E4c 重扫间隔改每秒", m_e4c, "E4c 全表扫间隔 >= 3 秒")
 
 
 def m_e4d():
-    """在补装里也加回全表扫 —— 一秒一次重扫。"""
+    """再加一个重扫调用点 —— 多头重扫。"""
     s = read("main.m")
-    old = "        if (gPipHookedCount > 0 || gPipRetryTick > PS_RETRY_MAX_TICKS) return;"
+    old = "        if (ready || gPipHookedCount > 0 || gPipRetryTick > PS_RETRY_MAX_TICKS) return;"
     assert old in s, "注入点没找到"
     s = s.replace(old,
                   "        PSInstallByScan(sel);\n" + old, 1)
     write("main.m", s)
 
 
-case("E4d 补装里也扫全表", m_e4d, "E4d PSInstallByScan 只有一个调用点")
+case("E4d 加第二个重扫调用点", m_e4d, "E4d PSInstallByScan 只有一个调用点")
 
 
 def m_e5():
-    """把全表扫延时改到 0.5 秒 —— 与首帧抢 CPU。"""
+    """把首次全表扫延后改到 1 秒 —— 与首帧抢 CPU。"""
     s = read("main.m")
-    s = s.replace("#define PS_SCAN_DELAY 8.0", "#define PS_SCAN_DELAY 0.5")
+    s = s.replace("#define PS_SCAN_FIRST_TICK   8", "#define PS_SCAN_FIRST_TICK   1")
     write("main.m", s)
 
 
-case("E5 全表扫延时改 0.5 秒", m_e5, "E5c 全表扫延时 >= 5 秒")
+case("E5 首次扫描延后改 1 秒", m_e5, "E5c 首次全表扫延后 >= 5 秒")
+
+
+def m_e5d():
+    """定义了延后常量却不用它 —— 判据必须能发现「常量空转」。"""
+    s = read("main.m")
+    old = "            gPipRetryTick >= PS_SCAN_FIRST_TICK &&"
+    assert old in s, "注入点没找到"
+    s = s.replace(old, "            YES &&")
+    write("main.m", s)
+
+
+case("E5d 首次延后常量空转（不用它）", m_e5d, "E5d 补装内真的校验了首次延后")
+
+
+def m_c13():
+    """★ 功能回退防护：把补装缩成「只试硬编码类」。
+
+    这正是我第一版修法犯的错 —— 为了让启动更快，把补装里的全表扫删了。
+    后果：抖音 lite 版 / 类名不同 / 懒注册的 delegate 永远装不上
+    → 小窗点了完全没反应。性能修好但功能没了，必须被拦住。
+    """
+    s = read("main.m")
+    old = """        // 还没装好 → 周期性重扫全表兜住「类名未知 / 懒注册」的情况
+        if (!ready && gPipHookedCount == 0 && sel &&
+            gPipRetryTick >= PS_SCAN_FIRST_TICK &&
+            (gPipRetryTick % PS_SCAN_EVERY_TICKS) == 0) {
+            int n = PSInstallByScan(sel);
+            if (n > 0) {
+                gPipHookedCount = n;
+                ready = YES;
+            }
+        }"""
+    assert old in s, "注入点没找到"
+    s = s.replace(old, "        // 补装里不再重扫全表")
+    write("main.m", s)
+
+
+case("C13 补装缩成只试硬编码类（功能回退）", m_c13, "C13 补装内仍会重扫全表")
 
 
 def m_e6():
