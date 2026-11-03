@@ -68,6 +68,16 @@ total = 0
 skipped = 0
 failed = []
 
+# ★★ 注入锚点：一个「文件作用域、唯一、且删了也不影响别处」的声明。
+#   ★ 1.0-3 换了全局状态变量（gPipInstalled → gPipHookedCount），
+#     旧的注入锚点文本随之失效 —— 反向用例会静默变成「注入不进去」。
+#     这正是「改实现必须同步改判据/用例」的实例。
+#   ★ 用 grep 确认唯一性：ANCHOR 在 main.m 里只能出现 1 次，
+#     否则 replace 会把多处同时改掉，注入结果不可控。
+ANCHOR = "static int  gPipHookedCount = 0;"
+assert open(os.path.join(ROOT, "main.m"), encoding="utf-8").read().count(ANCHOR) == 1, \
+    "ANCHOR 在 main.m 里不唯一，注入会不可控"
+
 
 def case(name, mutate, expect_gate):
     """注入一处违规，断言闸门必须红，且必须是 expect_gate 这条判据拦下的。
@@ -188,8 +198,8 @@ case("B1 改回 MSHook", m_b1, "B1b 不用 MSHookMessageEx")
 
 def m_b2():
     s = read("main.m")
-    s = s.replace("static BOOL gPipInstalled = NO;",
-                  "static BOOL gPipInstalled = NO;\nstatic void *PSDl(void){ return dlopen(\"x\", 2); }")
+    s = s.replace(ANCHOR,
+                  ANCHOR + '\nstatic void *PSDl(void){ return dlopen("x", 2); }')
     write("main.m", s)
 
 
@@ -264,14 +274,16 @@ case("B8h 槽位不判空（空指针解引用）", m_b8h, "B8h 解引用槽位�
 def m_b10():
     """去掉构造器最外层的 @try（内层 @try 保留 → 考验判据是否锚对了地方）。"""
     s = read("main.m")
-    old = """    @try {
-        // hook 必须在抖音创建画中画 delegate 之前装上，构造器里做最稳。
-        PSInstallPipHook();"""
+    old = "    @try {\n        // hook 必须在抖音创建画中画 delegate 之前装上，构造器里做最稳。"
     assert old in s, "注入点没找到（缩进/文本不符）"
-    new = """    {
-        // hook 必须在抖音创建画中画 delegate 之前装上，构造器里做最稳。
-        PSInstallPipHook();"""
+    new = "    {\n        // hook 必须在抖音创建画中画 delegate 之前装上，构造器里做最稳。"
     s = s.replace(old, new)
+    # 外层 @catch 一并去掉，否则语法不通（但内层 @catch 还在，仍能考验判据）
+    s = s.replace("    } @catch (NSException *e) {\n"
+                  "        // 绝不清已装好的 orig 槽位",
+                  "    }\n"
+                  "    if (0) {\n"
+                  "        // 绝不清已装好的 orig 槽位")
     write("main.m", s)
 
 
@@ -284,7 +296,7 @@ def m_b13():
     write("main.m", s)
 
 
-case("B13 参数个数校验改错", m_b13, "B13 校验参数个数为 5")
+case("B13 参数个数校验改错", m_b13, "B13b 校验参数个数为 5")
 
 
 # ================================================================
@@ -292,9 +304,10 @@ case("B13 参数个数校验改错", m_b13, "B13 校验参数个数为 5")
 # ================================================================
 def m_c1():
     s = read("main.m")
-    s = s.replace(
-        'NSSelectorFromString(@"pictureInPictureController:skipByInterval:completionHandler:")',
-        'NSSelectorFromString(@"pictureInPictureController:skipByInterval:completion:")')
+    # ★ 1.0-3 把 selector 收进了 PSPipSkipSelector()，字符串跨行书写，
+    #   所以注入点要跟着换成实际文本。
+    s = s.replace('@"pictureInPictureController:skipByInterval:completionHandler:"',
+                  '@"pictureInPictureController:skipByInterval:completion:"')
     write("main.m", s)
 
 
@@ -373,11 +386,11 @@ case("C10 去掉两屏门槛", m_c10, "C10d 至少能滚两屏")
 
 
 def m_c11():
+    """删掉构造器里的后台补装调度（delegate 懒注册时就没有第二次机会）。"""
     s = read("main.m")
-    s = s.replace("""        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            @try { PSInstallPipHook(); } @catch (NSException *e) { }
-        });""", "")
+    old = "        PSStartBackgroundRetry();"
+    assert old in s, "注入点没找到"
+    s = s.replace(old, "        // 后台补装被删掉了", 1)
     write("main.m", s)
 
 
@@ -386,14 +399,39 @@ case("C11 去掉延迟补装", m_c11, "C11d 构造器有延迟补装")
 
 def m_c12():
     s = read("main.m")
-    s = s.replace("""    if (byProto + byScan + byKnown > 0) {
-        gPipInstalled = YES;   // 只有真装上了才标记完成，否则留给补枚举
-    }""",
-                  """    gPipInstalled = YES;""")
+    s = s.replace("if (gPipHookedCount > 0 || gPipRetryTick > PS_RETRY_MAX_TICKS) return;",
+                  "if (gPipRetryTick > PS_RETRY_MAX_TICKS) return;")
     write("main.m", s)
 
 
-case("C12 无条件置完成标记", m_c12, "C12 只有装上类才置 gPipInstalled")
+case("C12 补装不看「已装数」→ 永不收工", m_c12, "C12b 装好即收工")
+
+
+def m_c2e():
+    """把 1.0-2 的「按协议逐类枚举」函数加回来 —— 就是那 10 秒的直接来源。"""
+    s = read("main.m")
+    s = s.replace(ANCHOR, ANCHOR + "\n"
+                  "static int PSHookClassesConformingTo(Class c, SEL s) {\n"
+                  "    (void)c; (void)s; return 0;\n"
+                  "}")
+    write("main.m", s)
+
+
+case("C2e 加回协议全表枚举函数", m_c2e, "C2e 没有独立的全表协议枚举函数")
+
+
+def m_c2f():
+    """在扫描循环里加回 class_conformsToProtocol —— 5 万次遍历协议链。"""
+    s = read("main.m")
+    old = "            if (!class_respondsToSelector(cls, sel)) continue;"
+    assert old in s, "注入点没找到"
+    s = s.replace(old,
+                  "            if (!class_respondsToSelector(cls, sel) &&\n"
+                  "                !class_conformsToProtocol(cls, @protocol(NSObject))) continue;")
+    write("main.m", s)
+
+
+case("C2f 扫表内加回逐类判协议", m_c2f, "C2f 扫表内不逐类判 conform 协议")
 
 
 # ================================================================
@@ -401,8 +439,7 @@ case("C12 无条件置完成标记", m_c12, "C12 只有装上类才置 gPipInsta
 # ================================================================
 def m_d1():
     s = read("main.m")
-    s = s.replace("static BOOL gPipInstalled = NO;",
-                  "static BOOL gPipInstalled = NO;\n"
+    s = s.replace(ANCHOR, ANCHOR + "\n"
                   "static void PSCmd(void){ MPRemoteCommandCenter *c=nil; (void)c; }")
     write("main.m", s)
 
@@ -412,8 +449,7 @@ case("D1 加回锁屏遥控", m_d1, "D1 不含锁屏遥控 MPRemoteCommandCenter
 
 def m_d2():
     s = read("main.m")
-    s = s.replace("static BOOL gPipInstalled = NO;",
-                  "static BOOL gPipInstalled = NO;\n"
+    s = s.replace(ANCHOR, ANCHOR + "\n"
                   "static void PSSeek(id p){ [p seekToTime:kCMTimeZero]; }")
     write("main.m", s)
 
@@ -423,8 +459,7 @@ case("D2 加回 seek hook", m_d2, "D2 不 hook seek seekToTime")
 
 def m_d3():
     s = read("main.m")
-    s = s.replace("static BOOL gPipInstalled = NO;",
-                  "static BOOL gPipInstalled = NO;\n"
+    s = s.replace(ANCHOR, ANCHOR + "\n"
                   "static UIApplication *gAppTmp = nil;\n"
                   "static void PSTouch(id o, id e){ [o sendEvent:e]; (void)gAppTmp; }")
     write("main.m", s)
@@ -435,8 +470,7 @@ case("D3 加回保持播放", m_d3, "D3 不含保持播放 sendEvent:")
 
 def m_d4():
     s = read("main.m")
-    s = s.replace("static BOOL gPipInstalled = NO;",
-                  "static BOOL gPipInstalled = NO;\n"
+    s = s.replace(ANCHOR, ANCHOR + "\n"
                   "static void PSLog(void){ [[NSUserDefaults standardUserDefaults] synchronize]; }")
     write("main.m", s)
 
@@ -502,6 +536,147 @@ def m_d7():
 
 
 case("D7 加回 preferenceloader 依赖", m_d7, "D7b 不依赖 preferenceloader")
+
+
+# ================================================================
+# E 组反向用例（把 1.0-2 的启动卡顿写法加回来，闸门必须拦住）
+#   ★★★ 这一组是 1.0-2 的真实事故：装完抖音冷启动要等 10 秒。
+#     根因是 pre-main 构造器里同步做了 4 次全量 objc 类表扫描，
+#     外加主线程 NSTimer 每秒重跑、连跑 30 秒。
+#     每条反向用例都对应一个具体的「退化写法」。
+# ================================================================
+def m_e1():
+    """构造器里直接调全表扫 —— 1.0-2 的原样写法。"""
+    s = read("main.m")
+    old = "        PSInstallFast();"
+    assert old in s, "注入点没找到"
+    s = s.replace(old, "        PSInstallByScan(PSPipSkipSelector());", 1)
+    write("main.m", s)
+
+
+case("E1 构造器里直接扫全表", m_e1, "E1 构造器体内不含 PSInstallByScan")
+
+
+def m_e1b():
+    """构造器里直接调 objc_getClassList。"""
+    s = read("main.m")
+    old = "        PSInstallFast();"
+    assert old in s, "注入点没找到"
+    s = s.replace(old,
+                  "        (void)objc_getClassList(NULL, 0);\n        PSInstallFast();", 1)
+    write("main.m", s)
+
+
+case("E1b 构造器里取全量类表", m_e1b, "E1 构造器体内不含 objc_getClassList")
+
+
+def m_e1c():
+    """构造器里不再做 O(1) 快装 —— 前 8 秒进小窗会失效。"""
+    s = read("main.m")
+    old = "        PSInstallFast();"
+    assert old in s, "注入点没找到"
+    s = s.replace(old, "        // 快装被删掉了", 1)
+    write("main.m", s)
+
+
+case("E1c 删掉构造器的 O(1) 快装", m_e1c, "E1b 构造器调 O(1) 的 PSInstallFast")
+
+
+def m_e2():
+    """全表扫排回主队列 —— 启动期 UI 直接卡住。"""
+    s = read("main.m")
+    old = """        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(PS_SCAN_DELAY * NSEC_PER_SEC)),
+        PSWorkQueue(), ^{"""
+    assert old in s, "注入点没找到"
+    s = s.replace(old, """        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(PS_SCAN_DELAY * NSEC_PER_SEC)),
+        dispatch_get_main_queue(), ^{""")
+    write("main.m", s)
+
+
+case("E2 全表扫改排主队列", m_e2, "E2b 全表扫调度到后台队列")
+
+
+def m_e3():
+    """后台队列改成并发 —— 多路扫表互相抢 CPU。"""
+    s = read("main.m")
+    s = s.replace("DISPATCH_QUEUE_SERIAL", "DISPATCH_QUEUE_CONCURRENT")
+    write("main.m", s)
+
+
+case("E3 后台队列改并发", m_e3, "E3b 队列是串行的")
+
+
+def m_e3c():
+    """后台队列改成默认优先级 —— 与启动抢 CPU。"""
+    s = read("main.m")
+    s = s.replace("QOS_CLASS_UTILITY", "QOS_CLASS_USER_INTERACTIVE")
+    write("main.m", s)
+
+
+case("E3c 队列优先级提到交互级", m_e3c, "E3c 队列是低优先级")
+
+
+def m_e4():
+    """去掉「已跑过」早退 —— 每次补装都重扫全表。"""
+    s = read("main.m")
+    old = "                if (gPipScanDone) return;"
+    assert old in s, "注入点没找到"
+    s = s.replace(old, "                // 早退被删掉了")
+    write("main.m", s)
+
+
+case("E4 去掉全表扫的已跑过早退", m_e4, "E4c 已跑过就早退")
+
+
+def m_e4d():
+    """在补装里也加回全表扫 —— 一秒一次重扫。"""
+    s = read("main.m")
+    old = "        if (gPipHookedCount > 0 || gPipRetryTick > PS_RETRY_MAX_TICKS) return;"
+    assert old in s, "注入点没找到"
+    s = s.replace(old,
+                  "        PSInstallByScan(sel);\n" + old, 1)
+    write("main.m", s)
+
+
+case("E4d 补装里也扫全表", m_e4d, "E4d PSInstallByScan 只有一个调用点")
+
+
+def m_e5():
+    """把全表扫延时改到 0.5 秒 —— 与首帧抢 CPU。"""
+    s = read("main.m")
+    s = s.replace("#define PS_SCAN_DELAY 8.0", "#define PS_SCAN_DELAY 0.5")
+    write("main.m", s)
+
+
+case("E5 全表扫延时改 0.5 秒", m_e5, "E5c 全表扫延时 >= 5 秒")
+
+
+def m_e6():
+    """去掉廉价预筛 —— 对 5 万个类逐个复制方法表（就是那 10 秒）。"""
+    s = read("main.m")
+    old = "            if (!class_respondsToSelector(cls, sel)) continue;"
+    assert old in s, "注入点没找到"
+    s = s.replace(old, "")
+    write("main.m", s)
+
+
+case("E6 去掉扫表的廉价预筛", m_e6, "E6 扫表内有廉价预筛 class_respondsToSelector")
+
+
+def m_e7():
+    """改回主线程 NSTimer 轮询 —— 1.0-2 的卡顿来源之一。"""
+    s = read("main.m")
+    old = "        PSStartBackgroundRetry();"
+    assert old in s, "注入点没找到"
+    s = s.replace(old,
+                  "        [NSTimer scheduledTimerWithTimeInterval:1.0\n"
+                  "                                        repeats:YES\n"
+                  "                                          block:^(NSTimer *t) { }];\n"
+                  "        PSStartBackgroundRetry();", 1)
+    write("main.m", s)
+
+
+case("E7 加回主线程 NSTimer 轮询", m_e7, "E7 不用 NSTimer")
 
 
 # ================================================================

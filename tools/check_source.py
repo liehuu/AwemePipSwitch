@@ -10,11 +10,12 @@
   · 查字符串字面量要分清编码：含中文的 @"..." 会被 clang 存成 UTF-16
     （__ustring），ASCII 搜索命中 0。所以本插件的可搜 tag 全是纯 ASCII。
 
-检查维度（都是「装了会崩 / 装了不生效」，不只查「编不过」）：
+检查维度（都是「装了会崩 / 装了不生效 / 装了卡死」，不只查「编不过」）：
   A 组：注入与加载的前提（错了 = 装了完全没反应）
   B 组：hook 装配的正确性（错了 = 崩宿主 或 静默失效）
   C 组：功能判据（错了 = 点了没反应）
   D 组：只做一件事的禁项（错了 = 又变成"整合版"）
+  E 组：启动路径性能（错了 = 启动慢十几秒，1.0-2 的真实事故）
 """
 import os
 import re
@@ -313,10 +314,12 @@ if ctor:
        "只查 @try 出现过会被内层 @try 代答")
     ok("@catch" in ctor_code, "B10c 构造器有 @catch")
     # 构造器里所有可能抛异常的调用都必须在 @try 内
-    ok("PSInstallPipHook();" in ctor_code, "B10d 构造器里真的调用安装函数")
+    # ★ 1.0-3 起构造器只调 O(1) 的 PSInstallFast + 后台调度（原来直接调
+    #   全表扫的 PSInstallPipHook，正是启动卡 10 秒的根因）。
+    ok("PSInstallFast();" in ctor_code, "B10d 构造器里真的调用安装函数")
 
 # B11 枚举遍历逐个 @try（单个类抛异常不能中断整轮）
-for fn in ("PSHookClassesBySelector", "PSHookClassesConformingTo"):
+for fn in ("PSInstallByScan",):
     b = body_of(src, fn)
     ok(b is not None, "B11 能找到 %s 函数体" % fn)
     if b:
@@ -330,8 +333,30 @@ if cd:
        "class_getInstanceMethod 会顺继承链返回父类方法，据此 hook 会多包一层")
 
 # B13 校验签名参数个数 = 5（self/_cmd/ctl/interval/completion）
-ok("method_getNumberOfArguments(m) != 5" in src, "B13 校验参数个数为 5")
-ok("enc[0] != 'v'" in src, "B13b 校验返回 void")
+#   ★ 1.0-3 起这段校验集中在 PSTryHookClass 里（三个入口共用一份）。
+tb = body_of(src, "PSTryHookClass")
+ok(tb is not None, "B13 能找到 PSTryHookClass 函数体")
+if tb:
+    ok("method_getNumberOfArguments(m) != 5" in tb, "B13b 校验参数个数为 5")
+    ok("enc[0] != 'v'" in tb, "B13c 校验返回 void")
+    ok("PSClassDeclaresSelector" in tb, "B13d 仍只认「自己声明」的方法")
+    ok("PSHookup" in tb, "B13e 走幂等闸装配")
+    ok("*slot = (void *)old" in tb, "B13f 装上后回填 orig 槽位",
+       "不回填 → orig 恒 NULL → 功能静默失效")
+
+# B14 「已装过」必须与「装不上」区分开
+#   ★★★ 这是 1.0-2 启动卡顿的第二段根因：补装只看「本次装上了几个」，
+#     而幂等闸会把「已装过」挡回 NO → 补装永远认为失败 → 每秒重跑全表扫
+#     连跑 30 秒。
+ok("PSKeyRegistered" in src, "B14 有「是否已登记」的查询函数")
+if tb:
+    ok("PSTryAlready" in tb, "B14b 已装过单独返回 PSTryAlready（不算失败）")
+kb = body_of(src, "PSKeyRegistered")
+ok(kb is not None, "B14c 能找到 PSKeyRegistered 函数体")
+if kb:
+    ok("gHookedKeys" in kb and "gHookedCount" in kb,
+       "B14d 查询读的是同一份幂等表（不能另建一份）")
+    ok("pthread_mutex_lock" in kb, "B14e 查询也加锁（补装在后台线程）")
 
 # ============================================================
 # C 组：功能判据（错了就没反应）
@@ -344,18 +369,44 @@ ok("pictureInPictureController:skipByInterval:completionHandler:" in src,
 ok("pictureInPictureController:skipByInterval:completion:" not in src,
    "C1b 不用错误的旧 selector 名")
 
-# C2 三条枚举路都要在（协议 / selector 全扫 / 硬编码兜底）
-ok("objc_getProtocol" in src, "C2 有协议枚举路")
-ok("PSHookClassesBySelector(" in src, "C2b 有 selector 全扫路")
+# C2 装配路必须覆盖「谁实现了这个方法」（1.0-3 起合并为一趟全扫）
+#   ★★★ 1.0-2 有三条路：协议枚举（3 个协议名 → 3 次全表扫）+ selector 全扫
+#     + 硬编码兜底。前两条里，协议路的条件是 selector 路的**严格子集**
+#     （A∧B ⊆ B）→ 那 3 次全表扫是纯浪费，正是启动卡 10 秒的主因。
+#     1.0-3 只保留「selector 全扫 + 硬编码兜底」两条，覆盖范围不变。
+ok("PSInstallByScan(" in src, "C2b 有 selector 全扫路")
 ok("AWEPictureInPictureSampleBufferPlayerView" in src, "C2c 有硬编码兜底类名",
    "这个类名是实机日志实证的落点，三条枚举路都可能落空")
-ok(src.count("kPipProtoNames") >= 2, "C2d 协议候选表存在且被使用")
+# 正项：兜底类必须在构造器阶段就被尝试（O(1)，不等全表扫）
+ok("PSInstallKnownClasses" in src, "C2d 硬编码类有独立安装入口")
 
-# C3 三个协议候选名都要在
+# C2e 绝不许把「按协议逐类枚举」加回来（启动卡 10 秒的直接来源）
+ok("PSHookClassesConformingTo" not in src,
+   "C2e 没有独立的全表协议枚举函数",
+   "协议路的条件是 selector 路的严格子集 → 多走一遍全表纯浪费，就是那 10 秒")
+
+# C3 三个协议候选名仍保留（诊断用，不参与装配）
 for proto in ("AVPictureInPictureSampleBufferPlaybackDelegate",
               "AWEPictureInPictureSampleBufferPlaybackDelegate",
               "AWEPictureInPicturePlaybackDelegate"):
     ok(proto in src, "C3 协议候选含 %s" % proto)
+
+# C3d 全表扫必须**只走一趟**（1.0-2 走了四趟 → 启动卡 10 秒）
+sc = body_of(src, "PSInstallByScan")
+ok(sc is not None, "C3d 能找到 PSInstallByScan 函数体")
+if sc:
+    ok(sc.count("objc_getClassList") == 2,
+       "C3e 一趟扫表只取两次类表（NULL 探长度 + 填充）",
+       "多次 objc_getClassList 循环 = 同一张表走多遍 = 启动卡死")
+    # 扫表内必须有廉价预筛（class_respondsToSelector），否则逐类复制方法表
+    ok("class_respondsToSelector" in sc,
+       "C3f 扫表内先做廉价预筛 class_respondsToSelector",
+       "对 5 万个类逐个 class_copyMethodList 就是那 10 秒")
+    # ★★ 判据锚 PSInstallByScan 函数体：扫描循环里不许出现 class_conformsToProtocol。
+    #   它不便宜（要遍历协议链），5 万个类逐个求值等于换一种慢法。
+    ok("class_conformsToProtocol" not in sc,
+       "C2f 扫表内不逐类判 conform 协议",
+       "class_conformsToProtocol 要遍历协议链，5 万次同样卡启动；且判它没有功能收益")
 
 # C4 时间差判据 8.5~16.5（覆盖 ±10 与 ±15）
 w = body_of(src, "PSPipSkipWanted")
@@ -410,20 +461,115 @@ if fz:
     ok("score > bestScore" in fz, "C10f 取最高分")
 
 # C11 补装机制必须存在（delegate 类是懒注册的）
-ok("PSInstallPipHook" in src, "C11 有安装函数")
-ip = body_of(src, "PSInstallPipHook")
-ok(ip is not None, "C11b 能找到 PSInstallPipHook 函数体")
-if ip:
-    ok("if (gPipInstalled) return;" in ip, "C11c 装成功后早退（幂等）")
-ok("dispatch_after" in ctor if ctor else False, "C11d 构造器有延迟补装")
-ok("NSTimer" in ctor if ctor else False, "C11e 构造器有轮询补装",
+ok("PSInstallKnownClasses" in src, "C11 有安装函数")
+kc = body_of(src, "PSInstallKnownClasses")
+ok(kc is not None, "C11b 能找到 PSInstallKnownClasses 函数体")
+if kc:
+    ok("PSTryHookClass" in kc, "C11c 硬编码类走完整校验装配")
+# ★ 1.0-3 起构造器不再自己 dispatch_after，而是交给 PSStartBackgroundRetry
+#   统一调度（全表扫还要额外延后到启动完成之后）。
+ok("PSStartBackgroundRetry" in ctor if ctor else False,
+   "C11d 构造器有延迟补装（委派 PSStartBackgroundRetry）")
+ok("PS_RETRY_MAX_TICKS" in src, "C11e 有轮询补装上限",
    "delegate 类可能第一次进小窗才注册，两次补装都可能错过")
 
-# C12 只有真装上才置标记（否则补装永远不重试）
-if ip:
-    ok("byProto + byScan + byKnown > 0" in ip,
-       "C12 只有装上类才置 gPipInstalled",
-       "无条件置位会让补装永不重试 → 小窗永久无效")
+# C12 补装必须能识别「已经装好了」（否则永远认为失败 → 每秒重跑全表扫）
+rt = body_of(src, "PSRetryTick")
+ok(rt is not None, "C12 能找到 PSRetryTick 函数体")
+if rt:
+    ok("gPipHookedCount > 0" in rt, "C12b 装好即收工（按已装数判，不按本次装数判）",
+       "按「本次装了几个」判 → 幂等闸挡住后永远认为失败 → 每秒重扫")
+    ok("PS_RETRY_MAX_TICKS" in rt, "C12c 有次数上限（不会无限跑）")
+
+# ============================================================
+# E 组：启动路径性能（1.0-2 的真实事故：装完启动要等 10 秒）
+#   背景：objc_getClassList 拿到 5 万个类，对每个类调 class_copyMethodList
+#   （malloc + 复制整张方法表）→ 单次全表 2~5 秒。1.0-2 在 pre-main
+#   构造器里同步跑了 4 次，还在主线程 NSTimer 里每秒再跑 4 次、连跑 30 秒。
+# ============================================================
+
+# E1 构造器绝不许直接做全表扫（pre-main 阻塞 = 启动慢的直接原因）
+ok(ctor is not None, "E1 能找到 PSCtor 函数体")
+if ctor:
+    ctor_code = strip_comments(ctor)
+    for bad in ("objc_getClassList", "PSInstallByScan", "class_copyMethodList"):
+        ok(bad not in ctor_code,
+           "E1 构造器体内不含 %s" % bad,
+           "pre-main 里扫全表 = 首帧被推迟十几秒（1.0-2 的事故）")
+    # 正项：构造器必须只调 O(1) 的快装路 + 后台调度
+    ok("PSInstallFast()" in ctor_code, "E1b 构造器调 O(1) 的 PSInstallFast")
+    ok("PSStartBackgroundRetry()" in ctor_code,
+       "E1c 构造器把重活交给后台（PSStartBackgroundRetry）")
+
+# E2 全表扫绝不许跑在主线程
+#   ★ 判据锚 dispatch 的目标队列：必须是 PSWorkQueue()（后台串行），
+#     不许是 dispatch_get_main_queue()。
+ds = body_of(src, "PSDeferredScan")
+ok(ds is not None, "E2 能找到 PSDeferredScan 函数体")
+if ds:
+    ok("PSWorkQueue()" in ds, "E2b 全表扫调度到后台队列")
+    ok("dispatch_get_main_queue" not in ds, "E2c 全表扫不排到主队列",
+       "排到主队列 = 启动期 UI 直接卡住")
+#   ★★ 注意：不能一刀切「全文件不许出现主队列」——切视频
+#     （PSHandlePipSkip → PSSwitchFeed）**必须**回主线程，那是 UIKit 硬要求。
+#     所以只约束「装配/扫描这条链」。
+for fn in ("PSRetryTick", "PSStartBackgroundRetry", "PSInstallFast",
+           "PSInstallKnownClasses", "PSInstallByScan", "PSInstallPipHook"):
+    fb = body_of(src, fn)
+    if fb is None:
+        continue
+    ok("dispatch_get_main_queue" not in fb,
+       "E2d %s 不占主队列" % fn,
+       "装配链排主队列 = 启动期 UI 直接卡住")
+
+# E3 后台队列必须是串行 + 低优先级（并发扫表会互相抢 CPU 放大卡顿）
+wq = body_of(src, "PSWorkQueue")
+ok(wq is not None, "E3 能找到 PSWorkQueue 函数体")
+if wq:
+    ok("DISPATCH_QUEUE_SERIAL" in wq, "E3b 队列是串行的")
+    ok("QOS_CLASS_UTILITY" in wq or "QOS_CLASS_BACKGROUND" in wq,
+       "E3c 队列是低优先级（不抢启动的 CPU）")
+    ok("dispatch_once" in wq, "E3d 队列只建一次")
+
+# E4 全表扫一辈子只跑一次（不能每 tick 重跑）
+ok("gPipScanDone" in src, "E4 有全表扫的「已跑过」标记")
+if ds:
+    ok("gPipScanDone = YES" in ds, "E4b 扫描前置位标记（异常也不会重跑）")
+    ok("if (gPipScanDone) return;" in ds, "E4c 已跑过就早退")
+# ★ 全表扫只允许在这两处被调用：延时扫描、以及 PSInstallPipHook 之外的地方。
+#   数调用点能防「又在某个循环里加回全表扫」。
+ok(src.count("PSInstallByScan(") == 2,
+   "E4d PSInstallByScan 只有一个调用点（实际 %d 处）" % src.count("PSInstallByScan("),
+   "多于一处 = 又在重复扫全表")
+
+# E5 全表扫必须延后到启动完成之后（不能和首帧抢 CPU）
+ok("PS_SCAN_DELAY" in src, "E5 全表扫有独立延时常量")
+ok(re.search(r"#define\s+PS_SCAN_DELAY\s+([0-9.]+)", src) is not None,
+   "E5b PS_SCAN_DELAY 是秒数常量")
+_m = re.search(r"#define\s+PS_SCAN_DELAY\s+([0-9.]+)", src)
+if _m:
+    ok(float(_m.group(1)) >= 5.0,
+       "E5c 全表扫延时 >= 5 秒（实际 %s）" % _m.group(1),
+       "太早扫会与首帧抢 CPU，启动照样慢")
+
+# E6 扫表内必须用「廉价预筛」，不能对每个类都复制方法表
+if sc:
+    ok("class_respondsToSelector" in sc, "E6 扫表内有廉价预筛 class_respondsToSelector",
+       "对 5 万个类逐个 class_copyMethodList 就是那 10 秒")
+    # ★ 昂贵调用只允许出现在 PSTryHookClass 里，不许出现在扫表循环体内
+    ok("class_copyMethodList" not in sc,
+       "E6b 扫表循环体内不直接复制方法表")
+    # 预筛必须在 PSTryHookClass 之前（否则预筛白做）
+    i_pre = sc.find("class_respondsToSelector")
+    i_try = sc.find("PSTryHookClass")
+    ok(i_pre >= 0 and i_try > i_pre, "E6c 预筛在装配之前（先筛后装）")
+
+# E7 绝不许用 NSTimer 做主线程轮询（1.0-2 的卡顿来源之一）
+ok("NSTimer" not in src, "E7 不用 NSTimer（改用 dispatch_after 后台递归）",
+   "主线程 NSTimer 每秒重跑装配 = 启动后仍持续卡")
+# 反向：递归重试用 dispatch_after
+if rt:
+    ok("dispatch_after" in rt, "E7b 补装用 dispatch_after 递归")
 
 # ============================================================
 # D 组：只做一件事的禁项（这是本次返工的核心纪律）
